@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  web-scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tech-news-scraper
+    ports:
+      - "8000:8000"
+    environment:
+      # OpenAI
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-ada-002}
+      # Supabase
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      # API Config
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - API_RELOAD=false
+      # Scraping
+      - NEWS_SOURCES=${NEWS_SOURCES:-}
+      - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.85}
+      # Output
+      - OUTPUT_DIR=/app/output
+    volumes:
+      # Persistir PDFs generados
+      - ./output:/app/output
+      # Para desarrollo: montar código fuente (comentar en producción)
+      # - ./src:/app/src
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - scraper-network
+
+networks:
+  scraper-network:
+    driver: bridge

@@ -58,12 +58,30 @@ class SupabaseStorage:
         self,
         articles: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Store multiple articles in batch."""
+        """Store multiple articles in batch using upsert to handle duplicates."""
+        if not articles:
+            return []
+
         try:
-            result = self.client.table(self.table_name).insert(articles).execute()
-            logger.info(f"Stored {len(articles)} articles")
+            # Deduplicate by URL within the batch (keep first occurrence)
+            seen_urls = set()
+            unique_articles = []
+            for article in articles:
+                if article["url"] not in seen_urls:
+                    seen_urls.add(article["url"])
+                    unique_articles.append(article)
+
+            if len(unique_articles) < len(articles):
+                logger.info(f"Removed {len(articles) - len(unique_articles)} duplicates within batch")
+
+            # Use upsert to handle any remaining duplicates gracefully
+            result = self.client.table(self.table_name).upsert(
+                unique_articles,
+                on_conflict="url"
+            ).execute()
+            logger.info(f"Stored {len(unique_articles)} articles")
             return result.data or []
-            
+
         except Exception as e:
             logger.error(f"Error storing articles batch: {e}")
             return []
@@ -128,10 +146,36 @@ class SupabaseStorage:
             self.client.table(self.table_name).delete().eq("id", article_id).execute()
             logger.info(f"Deleted article with ID: {article_id}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error deleting article: {e}")
             return False
+
+    def get_existing_urls(self, urls: List[str]) -> set[str]:
+        """Check which URLs already exist in the database.
+
+        Args:
+            urls: List of URLs to check
+
+        Returns:
+            Set of URLs that already exist in the database
+        """
+        if not urls:
+            return set()
+
+        try:
+            result = self.client.table(self.table_name)\
+                .select("url")\
+                .in_("url", urls)\
+                .execute()
+
+            existing = {row["url"] for row in result.data} if result.data else set()
+            logger.info(f"Found {len(existing)} existing URLs out of {len(urls)}")
+            return existing
+
+        except Exception as e:
+            logger.error(f"Error checking existing URLs: {e}")
+            return set()
     
     def create_schema_sql(self) -> str:
         """Generate SQL for creating the articles table with pgvector.

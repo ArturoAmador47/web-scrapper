@@ -1,0 +1,57 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Output (se monta como volumen)
+output/
+
+# Docs
+docs/
+*.md
+!README.md
+
+# n8n workflows
+n8n_workflows/
+
+# Tests (opcional, descomentar si no quieres incluir tests)
+# tests/
+
+# Scripts de desarrollo
+# scripts/
+
+# Misc
+.DS_Store
+Thumbs.db
+*.log

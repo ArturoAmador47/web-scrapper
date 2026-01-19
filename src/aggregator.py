@@ -105,35 +105,103 @@ class NewsAggregator:
     async def generate_digest(
         self,
         articles: List[Dict[str, Any]],
-        filename: Optional[str] = None
+        filename: Optional[str] = None,
+        group_by_topic: bool = True,
+        enrich: bool = True
     ) -> str:
-        """Generate PDF digest from articles."""
+        """Generate PDF digest from articles.
+
+        Args:
+            articles: List of processed articles with embeddings
+            filename: Optional output filename
+            group_by_topic: If True, cluster articles by topic and generate index
+            enrich: If True, add executive summary, top picks, and section briefs
+        """
         if not articles:
             logger.warning("No articles to generate digest from")
             return None
-        
-        pdf_path = self.pdf_generator.generate_pdf(articles, filename)
-        logger.info(f"Generated digest PDF: {pdf_path}")
+
+        if group_by_topic and len(articles) >= 3:
+            # Cluster articles by topic
+            logger.info("Clustering articles by topic...")
+            grouped_articles = await self.embeddings_service.cluster_and_name_articles(
+                articles,
+                max_clusters=8
+            )
+
+            if enrich:
+                # Enrich with executive summary, top picks, and briefs
+                logger.info("Enriching content with AI summaries...")
+                enriched_data = await self.embeddings_service.enrich_grouped_articles(
+                    grouped_articles,
+                    articles
+                )
+                pdf_path = self.pdf_generator.generate_pdf_enriched(enriched_data, filename)
+                logger.info(f"Generated enriched digest PDF: {pdf_path}")
+            else:
+                pdf_path = self.pdf_generator.generate_pdf_grouped(grouped_articles, filename)
+                logger.info(f"Generated grouped digest PDF: {pdf_path}")
+        else:
+            # Generate flat PDF
+            pdf_path = self.pdf_generator.generate_pdf(articles, filename)
+            logger.info(f"Generated digest PDF: {pdf_path}")
+
         return str(pdf_path)
     
+    def _filter_existing_articles(self, articles: List[Article]) -> List[Article]:
+        """Filter out articles that already exist in the database.
+
+        Args:
+            articles: List of scraped articles
+
+        Returns:
+            List of articles that don't exist in the database
+        """
+        if not articles:
+            return []
+
+        urls = [article.url for article in articles]
+        existing_urls = self.storage.get_existing_urls(urls)
+
+        if not existing_urls:
+            return articles
+
+        new_articles = [a for a in articles if a.url not in existing_urls]
+        logger.info(
+            f"Filtered existing articles: {len(articles)} -> {len(new_articles)} "
+            f"({len(existing_urls)} already in database)"
+        )
+        return new_articles
+
     async def run_full_pipeline(
         self,
         sources: Optional[List[str]] = None,
         deduplicate: bool = True,
         store: bool = True,
-        generate_pdf: bool = True
+        generate_pdf: bool = True,
+        group_by_topic: bool = True,
+        enrich: bool = True
     ) -> Dict[str, Any]:
         """Run the complete news aggregation pipeline.
-        
+
+        Args:
+            sources: Optional list of RSS feed URLs to scrape
+            deduplicate: Remove duplicate articles based on similarity
+            store: Store articles in Supabase database
+            generate_pdf: Generate PDF digest
+            group_by_topic: Cluster articles by topic in PDF (requires generate_pdf=True)
+            enrich: Add executive summary, top 3 picks, and section briefs (requires group_by_topic=True)
+
         Returns:
             Dictionary with pipeline results including article count and PDF path.
         """
         logger.info("Starting news aggregation pipeline")
         start_time = datetime.now()
-        
+
         # Step 1: Scrape articles
         articles = await self.scraper.scrape_all_sources(sources)
-        
+        total_scraped = len(articles)
+
         if not articles:
             logger.warning("No articles scraped")
             return {
@@ -141,25 +209,44 @@ class NewsAggregator:
                 "message": "No articles found",
                 "articles_scraped": 0
             }
-        
-        # Step 2: Process articles (embeddings + deduplication)
+
+        # Step 2: Filter out articles that already exist in database
+        if store:
+            articles = self._filter_existing_articles(articles)
+            if not articles:
+                logger.info("All articles already exist in database")
+                return {
+                    "success": True,
+                    "message": "All articles already exist in database",
+                    "articles_scraped": total_scraped,
+                    "articles_new": 0,
+                    "articles_processed": 0,
+                    "articles_stored": 0
+                }
+
+        # Step 3: Process articles (embeddings + deduplication)
         processed_articles = await self.process_articles(articles, deduplicate)
-        
-        # Step 3: Store articles
+
+        # Step 4: Store articles
         stored_articles = []
         if store and processed_articles:
             stored_articles = self.store_articles(processed_articles)
-        
-        # Step 4: Generate PDF
+
+        # Step 5: Generate PDF (with optional topic clustering and enrichment)
         pdf_path = None
         if generate_pdf and processed_articles:
-            pdf_path = await self.generate_digest(processed_articles)
-        
+            pdf_path = await self.generate_digest(
+                processed_articles,
+                group_by_topic=group_by_topic,
+                enrich=enrich
+            )
+
         elapsed_time = (datetime.now() - start_time).total_seconds()
-        
+
         result = {
             "success": True,
-            "articles_scraped": len(articles),
+            "articles_scraped": total_scraped,
+            "articles_new": len(articles),
             "articles_processed": len(processed_articles),
             "articles_stored": len(stored_articles),
             "pdf_path": pdf_path,

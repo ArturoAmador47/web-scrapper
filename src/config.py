@@ -42,7 +42,13 @@ class Settings(BaseSettings):
         """Get news sources as a list."""
         if not self.news_sources:
             return []
-        return [s.strip() for s in self.news_sources.split(",") if s.strip()]
+        sources = []
+        for s in self.news_sources.split(","):
+            s = s.strip()
+            # Skip empty strings and comments
+            if s and not s.startswith("#"):
+                sources.append(s)
+        return sources
 
 
 # Global settings instance

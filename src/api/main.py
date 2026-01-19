@@ -44,6 +44,14 @@ class ScrapeRequest(BaseModel):
         True,
         description="Whether to generate PDF digest"
     )
+    group_by_topic: bool = Field(
+        True,
+        description="Whether to group articles by topic in the PDF (uses AI clustering)"
+    )
+    enrich: bool = Field(
+        True,
+        description="Add executive summary, top 3 must-read articles, and section briefs (optimized for NotebookLM)"
+    )
 
 
 class ArticleResponse(BaseModel):
@@ -61,6 +69,7 @@ class PipelineResponse(BaseModel):
     success: bool
     message: Optional[str] = None
     articles_scraped: int
+    articles_new: Optional[int] = None
     articles_processed: int
     articles_stored: int
     pdf_path: Optional[str] = None
@@ -90,26 +99,29 @@ async def health_check():
 async def scrape_news(request: ScrapeRequest):
     """
     Scrape news articles from configured sources.
-    
+
     This endpoint triggers the full pipeline:
     1. Scrapes articles from RSS feeds
-    2. Generates embeddings
-    3. Deduplicates articles (optional)
-    4. Stores in Supabase (optional)
-    5. Generates PDF digest (optional)
+    2. Filters out existing articles (if store=True)
+    3. Generates embeddings
+    4. Deduplicates articles (optional)
+    5. Stores in Supabase (optional)
+    6. Clusters by topic and generates PDF digest (optional)
     """
     try:
         logger.info(f"Received scrape request: {request}")
-        
+
         result = await aggregator.run_full_pipeline(
             sources=request.sources,
             deduplicate=request.deduplicate,
             store=request.store,
-            generate_pdf=request.generate_pdf
+            generate_pdf=request.generate_pdf,
+            group_by_topic=request.group_by_topic,
+            enrich=request.enrich
         )
-        
+
         return PipelineResponse(**result)
-        
+
     except Exception as e:
         logger.error(f"Error in scrape endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -206,28 +218,32 @@ async def list_pdfs():
 async def n8n_webhook(data: Dict[str, Any]):
     """
     Webhook endpoint for n8n workflows.
-    
+
     Accepts a JSON payload with scraping configuration and triggers the pipeline.
     """
     try:
         logger.info(f"Received n8n webhook: {data}")
-        
+
         # Extract parameters from webhook data
         sources = data.get("sources")
         deduplicate = data.get("deduplicate", True)
         store = data.get("store", True)
         generate_pdf = data.get("generate_pdf", True)
-        
+        group_by_topic = data.get("group_by_topic", True)
+        enrich = data.get("enrich", True)
+
         # Run pipeline
         result = await aggregator.run_full_pipeline(
             sources=sources,
             deduplicate=deduplicate,
             store=store,
-            generate_pdf=generate_pdf
+            generate_pdf=generate_pdf,
+            group_by_topic=group_by_topic,
+            enrich=enrich
         )
-        
+
         return result
-        
+
     except Exception as e:
         logger.error(f"Error in n8n webhook: {e}")
         raise HTTPException(status_code=500, detail=str(e))
