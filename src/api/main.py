@@ -1,25 +1,52 @@
 """FastAPI application for the news aggregator."""
 
-from fastapi import FastAPI, HTTPException
+import os
+import re
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import logging
 from pathlib import Path
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# Regex for safe PDF filenames: alphanumeric, hyphens, underscores, dots
+SAFE_FILENAME_PATTERN = re.compile(r'^[a-zA-Z0-9_\-\.]+\.pdf$')
+
 from src.aggregator import NewsAggregator
 from src.config import settings
 from src.storage.supabase_storage import SupabaseStorage
+from src.security import safe_log_error, get_safe_error_detail, verify_api_key
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Rate limiter configuration
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="Tech News Aggregator API",
     description="Automated tech news aggregation with AI-powered deduplication",
     version="1.0.0"
 )
+
+# CORS configuration - restrict in production
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if not settings.api_key else [],  # Restrict if auth enabled
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+# Add rate limiter to app
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Global instances
 aggregator = NewsAggregator()
@@ -76,6 +103,66 @@ class PipelineResponse(BaseModel):
     elapsed_time: float
 
 
+class WebhookRequest(BaseModel):
+    """Request model for n8n webhook with input validation."""
+    sources: Optional[List[str]] = Field(
+        None,
+        description="List of RSS feed URLs. If not provided, uses configured sources."
+    )
+    deduplicate: bool = Field(
+        True,
+        description="Whether to deduplicate articles using embeddings"
+    )
+    store: bool = Field(
+        True,
+        description="Whether to store articles in Supabase"
+    )
+    generate_pdf: bool = Field(
+        True,
+        description="Whether to generate PDF digest"
+    )
+    group_by_topic: bool = Field(
+        True,
+        description="Whether to group articles by topic in the PDF"
+    )
+    enrich: bool = Field(
+        True,
+        description="Add executive summary, top 3 articles, and section briefs"
+    )
+
+    @field_validator('sources')
+    @classmethod
+    def validate_sources(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        """Validate that sources are valid HTTP/HTTPS URLs."""
+        if v is None:
+            return v
+
+        import re
+        url_pattern = re.compile(
+            r'^https?://'  # http:// or https://
+            r'[a-zA-Z0-9]'  # domain must start with alphanumeric
+            r'[a-zA-Z0-9\-\.]*'  # rest of domain
+            r'[a-zA-Z0-9]'  # domain must end with alphanumeric
+            r'(?::\d+)?'  # optional port
+            r'(?:/[^\s]*)?$'  # optional path
+        )
+
+        validated = []
+        for url in v:
+            if not isinstance(url, str):
+                raise ValueError(f"Source must be a string, got {type(url)}")
+            url = url.strip()
+            if not url:
+                continue
+            if not url_pattern.match(url):
+                raise ValueError(f"Invalid URL format: {url}")
+            if len(url) > 2048:
+                raise ValueError(f"URL too long: {url[:50]}...")
+            validated.append(url)
+
+        return validated if validated else None
+
+
 @app.get("/")
 async def root():
     """Root endpoint."""
@@ -96,7 +183,12 @@ async def health_check():
 
 
 @app.post("/scrape", response_model=PipelineResponse)
-async def scrape_news(request: ScrapeRequest):
+@limiter.limit("5/minute")
+async def scrape_news(
+    request: Request,
+    scrape_request: ScrapeRequest,
+    _api_key: str = Depends(verify_api_key)
+):
     """
     Scrape news articles from configured sources.
 
@@ -107,30 +199,35 @@ async def scrape_news(request: ScrapeRequest):
     4. Deduplicates articles (optional)
     5. Stores in Supabase (optional)
     6. Clusters by topic and generates PDF digest (optional)
+    
+    Requires X-API-Key header if API_KEY is configured.
     """
     try:
-        logger.info(f"Received scrape request: {request}")
+        logger.info(f"Received scrape request: deduplicate={scrape_request.deduplicate}, store={scrape_request.store}")
 
         result = await aggregator.run_full_pipeline(
-            sources=request.sources,
-            deduplicate=request.deduplicate,
-            store=request.store,
-            generate_pdf=request.generate_pdf,
-            group_by_topic=request.group_by_topic,
-            enrich=request.enrich
+            sources=scrape_request.sources,
+            deduplicate=scrape_request.deduplicate,
+            store=scrape_request.store,
+            generate_pdf=scrape_request.generate_pdf,
+            group_by_topic=scrape_request.group_by_topic,
+            enrich=scrape_request.enrich
         )
 
         return PipelineResponse(**result)
 
     except Exception as e:
-        logger.error(f"Error in scrape endpoint: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_log_error(logger, "Error in scrape endpoint", e)
+        raise HTTPException(status_code=500, detail=get_safe_error_detail(e))
 
 
 @app.get("/articles", response_model=List[ArticleResponse])
+@limiter.limit("30/minute")
 async def get_articles(
+    request: Request,
     limit: int = 100,
-    source: Optional[str] = None
+    source: Optional[str] = None,
+    _api_key: str = Depends(verify_api_key)
 ):
     """
     Retrieve stored articles from Supabase.
@@ -144,47 +241,59 @@ async def get_articles(
         return articles
         
     except Exception as e:
-        logger.error(f"Error retrieving articles: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_log_error(logger, "Error retrieving articles", e)
+        raise HTTPException(status_code=500, detail=get_safe_error_detail(e))
 
 
 @app.get("/pdf/{filename}")
-async def download_pdf(filename: str):
+@limiter.limit("30/minute")
+async def download_pdf(request: Request, filename: str):
     """
     Download a generated PDF file.
-    
+
     Args:
-        filename: Name of the PDF file
+        filename: Name of the PDF file (alphanumeric, hyphens, underscores only)
     """
     try:
-        # Sanitize filename to prevent path traversal
-        import os
+        # Step 1: Strip any directory components (defense layer 1)
         filename = os.path.basename(filename)
-        
-        # Ensure filename ends with .pdf
-        if not filename.endswith('.pdf'):
-            raise HTTPException(status_code=400, detail="Invalid file type")
-        
-        pdf_path = Path(settings.output_dir) / filename
-        
+
+        # Step 2: Validate filename against safe pattern (defense layer 2)
+        if not SAFE_FILENAME_PATTERN.match(filename):
+            logger.warning(f"Rejected unsafe filename: {filename}")
+            raise HTTPException(status_code=400, detail="Invalid filename format")
+
+        # Step 3: Construct and resolve paths
+        output_dir = Path(settings.output_dir).resolve()
+        pdf_path = (output_dir / filename).resolve()
+
+        # Step 4: Verify the resolved path is within output directory (defense layer 3)
+        try:
+            pdf_path.relative_to(output_dir)
+        except ValueError:
+            logger.warning(f"Path traversal attempt blocked: {filename}")
+            raise HTTPException(status_code=400, detail="Invalid file path")
+
+        # Step 5: Check file exists
         if not pdf_path.exists():
             raise HTTPException(status_code=404, detail="PDF not found")
-        
+
         return FileResponse(
             path=pdf_path,
             media_type="application/pdf",
             filename=filename
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error downloading PDF: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_log_error(logger, "Error downloading PDF", e)
+        raise HTTPException(status_code=500, detail=get_safe_error_detail(e))
 
 
 @app.get("/pdfs")
-async def list_pdfs():
+@limiter.limit("30/minute")
+async def list_pdfs(request: Request):
     """
     List all generated PDF files.
     """
@@ -210,43 +319,42 @@ async def list_pdfs():
         }
         
     except Exception as e:
-        logger.error(f"Error listing PDFs: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_log_error(logger, "Error listing PDFs", e)
+        raise HTTPException(status_code=500, detail=get_safe_error_detail(e))
 
 
-@app.post("/webhook/n8n")
-async def n8n_webhook(data: Dict[str, Any]):
+@app.post("/webhook/n8n", response_model=PipelineResponse)
+@limiter.limit("5/minute")
+async def n8n_webhook(
+    request: Request,
+    webhook_request: WebhookRequest,
+    _api_key: str = Depends(verify_api_key)
+):
     """
     Webhook endpoint for n8n workflows.
 
-    Accepts a JSON payload with scraping configuration and triggers the pipeline.
+    Accepts a validated JSON payload with scraping configuration and triggers the pipeline.
+    All inputs are validated using Pydantic models.
+    Requires X-API-Key header if API_KEY is configured.
     """
     try:
-        logger.info(f"Received n8n webhook: {data}")
+        logger.info(f"Received n8n webhook: sources={len(webhook_request.sources) if webhook_request.sources else 'default'}")
 
-        # Extract parameters from webhook data
-        sources = data.get("sources")
-        deduplicate = data.get("deduplicate", True)
-        store = data.get("store", True)
-        generate_pdf = data.get("generate_pdf", True)
-        group_by_topic = data.get("group_by_topic", True)
-        enrich = data.get("enrich", True)
-
-        # Run pipeline
+        # Run pipeline with validated parameters
         result = await aggregator.run_full_pipeline(
-            sources=sources,
-            deduplicate=deduplicate,
-            store=store,
-            generate_pdf=generate_pdf,
-            group_by_topic=group_by_topic,
-            enrich=enrich
+            sources=webhook_request.sources,
+            deduplicate=webhook_request.deduplicate,
+            store=webhook_request.store,
+            generate_pdf=webhook_request.generate_pdf,
+            group_by_topic=webhook_request.group_by_topic,
+            enrich=webhook_request.enrich
         )
 
-        return result
+        return PipelineResponse(**result)
 
     except Exception as e:
-        logger.error(f"Error in n8n webhook: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_log_error(logger, "Error in n8n webhook", e)
+        raise HTTPException(status_code=500, detail=get_safe_error_detail(e))
 
 
 @app.get("/config")

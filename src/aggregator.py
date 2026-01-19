@@ -132,9 +132,8 @@ class NewsAggregator:
             if enrich:
                 # Enrich with executive summary, top picks, and briefs
                 logger.info("Enriching content with AI summaries...")
-                enriched_data = await self.embeddings_service.enrich_grouped_articles(
-                    grouped_articles,
-                    articles
+                enriched_data = self.embeddings_service.enrich_grouped_articles(
+                    grouped_articles
                 )
                 pdf_path = self.pdf_generator.generate_pdf_enriched(enriched_data, filename)
                 logger.info(f"Generated enriched digest PDF: {pdf_path}")

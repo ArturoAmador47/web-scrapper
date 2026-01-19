@@ -1,9 +1,12 @@
 """PDF generation module using WeasyPrint."""
 
+import html
 import logging
+import re
 from typing import List, Dict, Any
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 import markdown
 
 try:
@@ -16,6 +19,77 @@ from src.config import settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def sanitize_text(text: str, max_length: int = 10000) -> str:
+    """Sanitize text content to prevent XSS attacks.
+
+    Args:
+        text: Raw text content
+        max_length: Maximum allowed length
+
+    Returns:
+        Sanitized and escaped text
+    """
+    if not text:
+        return ""
+    # Truncate to max length
+    text = str(text)[:max_length]
+    # Escape HTML special characters
+    return html.escape(text)
+
+
+def sanitize_url(url: str) -> str:
+    """Sanitize URL to prevent javascript: and other dangerous schemes.
+
+    Args:
+        url: Raw URL string
+
+    Returns:
+        Sanitized URL or '#' if invalid
+    """
+    if not url:
+        return "#"
+
+    url = str(url).strip()
+
+    # Parse URL
+    try:
+        parsed = urlparse(url)
+        # Only allow http and https schemes
+        if parsed.scheme not in ("http", "https", ""):
+            logger.warning(f"Blocked dangerous URL scheme: {parsed.scheme}")
+            return "#"
+        # If no scheme, assume https
+        if not parsed.scheme and parsed.netloc:
+            url = f"https://{url}"
+        elif not parsed.scheme and not parsed.netloc and parsed.path:
+            # Relative URL or just path - could be dangerous
+            if parsed.path.startswith("javascript:") or parsed.path.startswith("data:"):
+                return "#"
+        return html.escape(url)
+    except Exception:
+        return "#"
+
+
+def text_to_paragraphs(text: str) -> str:
+    """Convert text with newlines to HTML paragraphs, safely.
+
+    Args:
+        text: Text content with potential newlines
+
+    Returns:
+        HTML with proper paragraph tags
+    """
+    if not text:
+        return ""
+    # Sanitize first
+    safe_text = sanitize_text(text)
+    # Split by double newlines for paragraphs
+    paragraphs = re.split(r'\n\n+', safe_text)
+    # Single newlines become <br>
+    paragraphs = [p.replace('\n', '<br>') for p in paragraphs if p.strip()]
+    return '</p><p>'.join(paragraphs)
 
 
 class PDFGenerator:
@@ -317,9 +391,12 @@ class PDFGenerator:
         """Generate visually rich HTML with badges, cards, and better hierarchy.
 
         Optimized for PDF generation with visual aids for easier reading.
+        All dynamic content is sanitized to prevent XSS attacks.
         """
-        title = title or settings.pdf_title
-        executive_summary = enriched_data.get("executive_summary", "")
+        # Sanitize title
+        title = sanitize_text(title or settings.pdf_title, max_length=200)
+        # Sanitize executive summary
+        executive_summary = text_to_paragraphs(enriched_data.get("executive_summary", ""))
         top_articles = enriched_data.get("top_articles", [])
         topics = enriched_data.get("topics", [])
         total_articles = sum(len(t["articles"]) for t in topics)
@@ -682,7 +759,7 @@ class PDFGenerator:
     </div>
 
     <div class="executive-summary">
-        <p>{executive_summary.replace(chr(10), '</p><p>')}</p>
+        <p>{executive_summary}</p>
     </div>
 """
 
@@ -702,10 +779,11 @@ class PDFGenerator:
                 p_label = priority_labels[idx] if idx < 3 else "Notable"
                 card_class = f"priority-{idx+1}" if idx < 3 else "priority-3"
 
-                title_text = article.get('title', 'No Title')
-                reason = article.get('relevance_reason', '')
-                source = article.get('source', 'Unknown')
-                content = article.get('content', '')[:250]
+                # Sanitize all dynamic content
+                title_text = sanitize_text(article.get('title', 'No Title'), max_length=300)
+                reason = sanitize_text(article.get('relevance_reason', ''), max_length=500)
+                source = sanitize_text(article.get('source', 'Unknown'), max_length=100)
+                content = sanitize_text(article.get('content', '')[:250], max_length=300)
 
                 html += f"""
     <div class="must-read-card {card_class}">
@@ -729,8 +807,8 @@ class PDFGenerator:
 """
         for idx, topic in enumerate(topics):
             color = topic_colors[idx % len(topic_colors)]
-            topic_name = topic["topic_name"]
-            count = len(topic["articles"])
+            topic_name = sanitize_text(topic.get("topic_name", "Topic"), max_length=100)
+            count = len(topic.get("articles", []))
             html += f'        <span class="topic-pill" style="background: {color};">{topic_name} ({count})</span>\n'
 
         html += "    </div>\n\n    <div class=\"divider\"></div>\n"
@@ -738,9 +816,9 @@ class PDFGenerator:
         # Topic sections with narratives
         for idx, topic in enumerate(topics):
             color = topic_colors[idx % len(topic_colors)]
-            topic_name = topic["topic_name"]
-            narrative = topic.get("narrative", "")
-            articles = topic["articles"]
+            topic_name = sanitize_text(topic.get("topic_name", "Topic"), max_length=100)
+            narrative = text_to_paragraphs(topic.get("narrative", ""))
+            articles = topic.get("articles", [])
 
             html += f"""
     <div class="topic-section">
@@ -750,16 +828,17 @@ class PDFGenerator:
         </div>
 
         <div class="narrative-box">
-            <p>{narrative.replace(chr(10), '</p><p>')}</p>
+            <p>{narrative}</p>
         </div>
 
         <div class="sources-section">
             <div class="sources-title">📎 Sources</div>
 """
             for article in articles:
-                a_title = article.get('title', 'No Title')
-                a_source = article.get('source', 'Unknown')
-                a_url = article.get('url', '#')
+                # Sanitize all article data
+                a_title = sanitize_text(article.get('title', 'No Title'), max_length=300)
+                a_source = sanitize_text(article.get('source', 'Unknown'), max_length=100)
+                a_url = sanitize_url(article.get('url', '#'))
                 html += f"""            <div class="source-item">
                 <span class="source-bullet">•</span>
                 <a href="{a_url}">{a_title}</a>

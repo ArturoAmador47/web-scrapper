@@ -6,6 +6,7 @@ from datetime import datetime
 from supabase import create_client, Client
 
 from src.config import settings
+from src.security import safe_log_error
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,11 +48,11 @@ class SupabaseStorage:
             }
             
             result = self.client.table(self.table_name).insert(data).execute()
-            logger.info(f"Stored article: {title}")
+            logger.info(f"Stored article: {title[:50]}")
             return result.data[0] if result.data else None
             
         except Exception as e:
-            logger.error(f"Error storing article: {e}")
+            safe_log_error(logger, "Error storing article", e)
             return None
     
     def store_articles_batch(
@@ -83,7 +84,7 @@ class SupabaseStorage:
             return result.data or []
 
         except Exception as e:
-            logger.error(f"Error storing articles batch: {e}")
+            safe_log_error(logger, "Error storing articles batch", e)
             return []
     
     def search_similar_articles(
@@ -112,7 +113,7 @@ class SupabaseStorage:
             return result.data or []
             
         except Exception as e:
-            logger.error(f"Error searching similar articles: {e}")
+            safe_log_error(logger, "Error searching similar articles", e)
             return []
     
     def get_articles(
@@ -137,7 +138,7 @@ class SupabaseStorage:
             return result.data or []
             
         except Exception as e:
-            logger.error(f"Error retrieving articles: {e}")
+            safe_log_error(logger, "Error retrieving articles", e)
             return []
     
     def delete_article(self, article_id: int) -> bool:
@@ -148,7 +149,7 @@ class SupabaseStorage:
             return True
 
         except Exception as e:
-            logger.error(f"Error deleting article: {e}")
+            safe_log_error(logger, "Error deleting article", e)
             return False
 
     def get_existing_urls(self, urls: List[str]) -> set[str]:
@@ -174,7 +175,7 @@ class SupabaseStorage:
             return existing
 
         except Exception as e:
-            logger.error(f"Error checking existing URLs: {e}")
+            safe_log_error(logger, "Error checking existing URLs", e)
             return set()
     
     def create_schema_sql(self) -> str:
